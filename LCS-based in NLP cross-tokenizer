@@ -1,0 +1,154 @@
+from typing import List, Tuple, Iterable
+SPECIAL_DEFAULT = {
+    "<s>", "</s>", "<pad>", "<unk>", "<bos>", "<eos>",
+    "[PAD]", "[UNK]", "[CLS]", "[SEP]", "[BOS]", "[EOS]"
+}
+
+def token_surface(token: str) -> str:
+    """
+    Chuyển token sang dạng surface để khớp với text gốc:
+    - 'Ġword'  -> ' word'  (GPT-2 style: space prefix)
+    - '##ing'  -> 'ing'    (WordPiece: subword continuation)  
+    - token khác -> giữ nguyên
+    """
+    if token.startswith("Ġ"):
+        return " " + token[1:]
+    elif token.startswith("##"):
+        return token[2:]
+    else:
+        return token
+def tokens_to_offsets(
+    text: str,
+    tokens: Iterable[str],
+    special_tokens: Iterable[str] = SPECIAL_DEFAULT
+) -> List[int]:
+    """
+    Tính offsets cho mỗi token trong text.
+    
+    Args:
+        text: Văn bản gốc
+        tokens: Danh sách các token
+        special_tokens: Các token đặc biệt (trả về offset = 0)
+        
+    Returns:
+        List offsets: offset[i] là vị trí kết thúc của token i trong text
+                     Special token có offset = 0
+    """
+    specials = set(special_tokens)
+    offsets = []
+    text_pos = 0  
+
+    for token in tokens:
+
+        if token in specials:
+            offsets.append(0)
+            continue
+        surface = token_surface(token)
+
+        if not token.startswith("##"):
+            while text_pos < len(text) and text[text_pos].isspace():
+                text_pos += 1
+        found_pos = text.find(surface, text_pos)
+        
+        if found_pos == -1:
+            temp_pos = text_pos
+            while temp_pos < len(text) and text[temp_pos].isspace():
+                temp_pos += 1
+            found_pos = text.find(surface, temp_pos)
+            
+            if found_pos == -1:
+                offsets.append(0)
+                continue
+            else:
+                text_pos = temp_pos
+
+        end_pos = found_pos + len(surface)
+        offsets.append(end_pos)
+        text_pos = end_pos
+
+    return offsets
+Span = Tuple[int, int]      # (start_token_idx, end_token_idx)
+Match = Tuple[Span, Span]   # (student_span, teacher_span)
+
+def lcs_span_alignment(
+    teacher_offsets: List[int],
+    student_offsets: List[int], 
+    teacher_start: int,
+    student_start: int
+) -> List[Match]:
+    """
+    Căn chỉnh các token sequences dựa trên LCS (Longest Common Subsequence).
+    
+    Args:
+        teacher_offsets: Offsets của teacher tokens
+        student_offsets: Offsets của student tokens  
+        teacher_start: Chỉ số token đầu tiên không đặc biệt (teacher)
+        student_start: Chỉ số token đầu tiên không đặc biệt (student)
+        
+    Returns:
+        List các cặp spans được căn chỉnh
+    """
+    m, n = len(teacher_offsets), len(student_offsets)
+    t_idx, s_idx = 0, 0
+    anchor_points = [(teacher_start, student_start)]
+    matches = []
+
+    while t_idx < m and s_idx < n:
+        if teacher_offsets[t_idx] == 0:
+            t_idx += 1
+            continue
+        if student_offsets[s_idx] == 0:
+            s_idx += 1
+            continue
+        if teacher_offsets[t_idx] == student_offsets[s_idx]:
+            teacher_span = (anchor_points[-1][0], t_idx)
+            student_span = (anchor_points[-1][1], s_idx) 
+            
+            matches.append((student_span, teacher_span))
+            
+            anchor_points.append((t_idx + 1, s_idx + 1))
+            
+            t_idx += 1
+            s_idx += 1
+        else:
+            if teacher_offsets[t_idx] < student_offsets[s_idx]:
+                t_idx += 1
+            else:
+                s_idx += 1
+                
+    return matches
+def main():
+    """Demo hệ thống token alignment"""
+    
+    # Văn bản gốc
+    text = "The cats are running quickly"
+    teacher_tokens = ["<s>", "The", "cat", "s", "are", "run", "ning", "quickly", "</s>"]
+    student_tokens = ["<s>", "The", "cats", "are", "running", "quick", "ly", "</s>"]
+    
+    # Bước 1: Tính offsets
+    teacher_offsets = tokens_to_offsets(text, teacher_tokens)
+    student_offsets = tokens_to_offsets(text, student_tokens)
+    
+    print(f"\nTeacher offsets: {teacher_offsets}")
+    print(f"Student offsets: {student_offsets}")
+    
+    # Bước 2: Tìm token không đặc biệt đầu tiên
+    teacher_start = next((i for i, offset in enumerate(teacher_offsets) if offset != 0), 0)
+    student_start = next((i for i, offset in enumerate(student_offsets) if offset != 0), 0)
+    
+    print(f"\nFirst non-special token - Teacher: {teacher_start}, Student: {student_start}")
+    
+    # Bước 3: Thực hiện alignment
+    matches = lcs_span_alignment(teacher_offsets, student_offsets, teacher_start, student_start)
+    print(f"Found {len(matches)} matched spans:")
+    
+    for i, ((s_start, s_end), (t_start, t_end)) in enumerate(matches):
+        student_span = student_tokens[s_start:s_end+1] if s_end < len(student_tokens) else student_tokens[s_start:]
+        teacher_span = teacher_tokens[t_start:t_end+1] if t_end < len(teacher_tokens) else teacher_tokens[t_start:]
+        
+        print(f"- Match {i+1}:")
+        print(f"Student [{s_start}:{s_end}] = {student_span}")
+        print(f"Teacher [{t_start}:{t_end}] = {teacher_span}")
+
+if __name__ == "__main__":
+    main()
