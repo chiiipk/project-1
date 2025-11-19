@@ -1,0 +1,263 @@
+from transformers import AutoTokenizer
+from collections import Counter
+import numpy as np
+from datasets import load_dataset
+from functools import lru_cache
+import time
+import re
+
+
+tk_teacher = AutoTokenizer.from_pretrained("gpt2")
+tk_student = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+# tránh warning về max_length (vì mình không cho vào model, chỉ dùng tokenizer)
+tk_teacher.model_max_length = 10**9
+tk_student.model_max_length = 10**9
+
+# =========================
+# 0. Normalize token string
+# =========================
+
+def normalize_token(tok: str) -> str:
+    """
+    Chuẩn hoá token từ các tokenizer khác nhau về dạng gần giống word:
+    - bỏ prefix kiểu 'Ġ', '▁' (GPT2/SentencePiece)
+    - bỏ '#' / '##' (BERT subword)
+    - lower-case
+    """
+    tok = tok.strip()
+    # bỏ các prefix subword phổ biến
+    tok = tok.lstrip("Ġ▁")
+    tok = tok.lstrip("#")
+    return tok.lower()
+
+# =========================
+# 2. Bottom-up DP: LCS & MinED
+# =========================
+
+def lcs_length(a, b):
+    """Bottom-up LCS length trên list token (string đã normalize)."""
+    m, n = len(a), len(b)
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(1, m+1):
+        ai = a[i-1]
+        row_i = dp[i]
+        row_i_1 = dp[i-1]
+        for j in range(1, n+1):
+            if ai == b[j-1]:
+                row_i[j] = row_i_1[j-1] + 1
+            else:
+                # max(dp[i-1][j], dp[i][j-1])
+                row_i[j] = row_i[j-1] if row_i[j-1] > row_i_1[j] else row_i_1[j]
+    return dp[m][n]
+
+def mined_align(a, b):
+    """
+    Bottom-up Edit Distance (MinED) + traceback thành span alignment.
+    a, b: list token (string đã normalize).
+    Trả về: list các cặp (lT, rT, lS, rS) theo chỉ số [l, r] inclusive.
+    """
+    m, n = len(a), len(b)
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(m+1):
+        dp[i][0] = i
+    for j in range(n+1):
+        dp[0][j] = j
+
+    for i in range(1, m+1):
+        ai = a[i-1]
+        row_i = dp[i]
+        row_i_1 = dp[i-1]
+        for j in range(1, n+1):
+            cost_sub = 0 if ai == b[j-1] else 1
+            row_i[j] = min(
+                row_i_1[j] + 1,          # delete
+                row_i[j-1] + 1,          # insert
+                row_i_1[j-1] + cost_sub  # substitute / match
+            )
+
+    i, j = m, n
+    spans = []
+    cur_T, cur_S = [], []
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] and a[i-1] == b[j-1]:
+            # match
+            cur_T.append(i-1)
+            cur_S.append(j-1)
+            i -= 1
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
+            # delete a[i-1]
+            i -= 1
+        else:
+            # insert b[j-1]
+            j -= 1
+
+        # nếu đang có 1 block match mà bị "gãy" thì chốt span
+        if (not cur_T or not cur_S) or i == 0 or j == 0:
+            if cur_T and cur_S:
+                spans.append((min(cur_T), max(cur_T), min(cur_S), max(cur_S)))
+                cur_T, cur_S = [], []
+
+    spans = spans[::-1]
+    return spans
+
+def edit_distance_bottom_up(a, b):
+    """Chỉ lấy Edit Distance (không traceback) cho MinED trên token string."""
+    m, n = len(a), len(b)
+    dp = [[0]*(n+1) for _ in range(m+1)]
+    for i in range(m+1):
+        dp[i][0] = i
+    for j in range(n+1):
+        dp[0][j] = j
+    for i in range(1, m+1):
+        ai = a[i-1]
+        row_i = dp[i]
+        row_i_1 = dp[i-1]
+        for j in range(1, n+1):
+            cost_sub = 0 if ai == b[j-1] else 1
+            row_i[j] = min(
+                row_i_1[j] + 1,
+                row_i[j-1] + 1,
+                row_i_1[j-1] + cost_sub
+            )
+    return dp[m][n]
+
+# =========================
+# 3. Top-down (đệ quy + memo) – chỉ dùng demo, không benchmark chuỗi dài
+# =========================
+
+def lcs_length_topdown(a, b):
+    """Top-down (recursive) LCS length with memoization trên token string."""
+    m, n = len(a), len(b)
+
+    @lru_cache(maxsize=None)
+    def f(i, j):
+        if i == 0 or j == 0:
+            return 0
+        if a[i-1] == b[j-1]:
+            return 1 + f(i-1, j-1)
+        return max(f(i-1, j), f(i, j-1))
+
+    return f(m, n)
+
+def edit_distance_topdown(a, b):
+    """Top-down Edit Distance (MinED) với memoization trên token string."""
+    m, n = len(a), len(b)
+
+    @lru_cache(maxsize=None)
+    def f(i, j):
+        if i == 0:
+            return j
+        if j == 0:
+            return i
+        cost_sub = 0 if a[i-1] == b[j-1] else 1
+        return min(
+            f(i-1, j) + 1,
+            f(i, j-1) + 1,
+            f(i-1, j-1) + cost_sub
+        )
+
+    return f(m, n)
+
+# =========================
+# 4. Lấy dữ liệu: WikiText-2 + 2 bộ khác
+# =========================
+
+def load_100_wikitext2():
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    texts = [ex["text"].strip() for ex in ds if ex["text"].strip()]
+    return texts[:100]
+
+def load_100_cnndm():
+    ds = load_dataset("cnn_dailymail", "3.0.0", split="train")
+    texts = [ex["article"].strip() for ex in ds if ex["article"].strip()]
+    return texts[:100]
+
+def load_100_agnews():
+    ds = load_dataset("ag_news", split="train")
+    texts = [ex["text"].strip() for ex in ds if ex["text"].strip()]
+    return texts[:100]
+
+def load_all_corpora():
+    corpora = {
+        "wikitext-2": load_100_wikitext2(),
+        "cnn_dailymail": load_100_cnndm(),
+        "ag_news": load_100_agnews(),
+    }
+    return corpora
+
+
+def timed_ms(fn, *args, **kwargs):
+    """Chạy fn và trả về (kết_quả, thời_gian_ms)."""
+    t0 = time.perf_counter()
+    out = fn(*args, **kwargs)
+    t1 = time.perf_counter()
+    return out, (t1 - t0) * 1000.0
+
+def tokenize_pair(text, max_len=128):
+    """
+    Tokenize text bằng teacher & student,
+    trả về list token string đã normalize, cắt tối đa max_len.
+    """
+    t_tok = tk_teacher.tokenize(text)[:max_len]
+    s_tok = tk_student.tokenize(text)[:max_len]
+    t_norm = [normalize_token(x) for x in t_tok]
+    s_norm = [normalize_token(x) for x in s_tok]
+    return t_norm, s_norm
+
+def coverage_from_spans(spans, len_teacher):
+    """Tính coverage trên teacher từ list spans (lT, rT, lS, rS)."""
+    covered = set()
+    for lT, rT, _, _ in spans:
+        covered.update(range(lT, rT+1))
+    if len_teacher == 0:
+        return 0.0
+    return len(covered) / len_teacher
+
+def experiment_time_and_coverage():
+    corpora = load_all_corpora()
+
+    for name, texts in corpora.items():
+        lcs_times = []
+        mined_times = []
+        lcs_covs = []
+        mined_covs = []
+        len_T = []
+        len_S = []
+        num_spans = []
+
+        for text in texts:
+            t_tok, s_tok = tokenize_pair(text, max_len=128)
+            if len(t_tok) == 0 or len(s_tok) == 0:
+                continue
+
+            len_T.append(len(t_tok))
+            len_S.append(len(s_tok))
+
+            # Bottom-up LCS + coverage LCS (Exact Match trên token string normalize)
+            lcs_val, t_lcs = timed_ms(lcs_length, t_tok, s_tok)
+            lcs_times.append(t_lcs)
+            lcs_covs.append(lcs_val / len(t_tok))
+
+            # Bottom-up MinED (distance, đo thời gian)
+            _, t_mined = timed_ms(edit_distance_bottom_up, t_tok, s_tok)
+            mined_times.append(t_mined)
+
+            # Span alignment từ MinED để tính coverage
+            spans = mined_align(t_tok, s_tok)
+            num_spans.append(len(spans))
+            mined_covs.append(coverage_from_spans(spans, len(t_tok)))
+
+        def avg(xs):
+            return float(np.mean(xs)) if xs else 0.0
+
+        print(f"=== Dataset: {name} ===")
+        print(f"  Bottom-up time LCS   : {avg(lcs_times):8.3f} ms")
+        print(f"  Bottom-up time MinED : {avg(mined_times):8.3f} ms")
+        print(f"  Coverage LCS (EM)    : {avg(lcs_covs):6.3f}")
+        print(f"  Coverage MinED       : {avg(mined_covs):6.3f}")
+        print()
+
+if __name__ == "__main__":
+    experiment_time_and_coverage()
